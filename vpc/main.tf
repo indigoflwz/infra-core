@@ -1,67 +1,107 @@
-terraform {
-  required_version = ">= 1.5.0"
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.0"
-    }
-  }
+locals {
+  name = "${var.project}-${var.environment}"
+  tags = merge({
+    Project     = var.project
+    Environment = var.environment
+    ManagedBy   = "terraform"
+  }, var.tags)
 }
 
-provider "aws" {
-  region = var.region
+data "aws_availability_zones" "this" {
+  state = "available"
 }
 
-resource "aws_s3_bucket" "tf_state" {
-  bucket = var.bucket_name
-  force_destroy = false
+# VPC
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+  tags = merge(local.tags, { Name = "${local.name}-vpc" })
 }
 
-resource "aws_s3_bucket_versioning" "tf_state" {
-  bucket = aws_s3_bucket.tf_state.id
-  versioning_configuration { status = "Enabled" }
+# IGW for public subnets
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+  tags   = merge(local.tags, { Name = "${local.name}-igw" })
 }
 
-resource "aws_s3_bucket_server_side_encryption_configuration" "tf_state" {
-  bucket = aws_s3_bucket.tf_state.id
-  rule { apply_server_side_encryption_by_default { sse_algorithm = "AES256" } }
+# Create public & private subnets across AZs (2 by default)
+# We split the /16 into /20s (adjust as you like)
+locals {
+  azs           = slice(data.aws_availability_zones.this.names, 0, var.az_count)
+  public_cidrs  = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 4, i)]                # /20s
+  private_cidrs = [for i in range(var.az_count) : cidrsubnet(var.vpc_cidr, 4, i + 8)]            # offset
 }
 
-resource "aws_s3_bucket_public_access_block" "tf_state" {
-  bucket                  = aws_s3_bucket.tf_state.id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+resource "aws_subnet" "public" {
+  for_each                = { for idx, az in local.azs : az => {
+    cidr = local.public_cidrs[idx]
+  }}
+  vpc_id                  = aws_vpc.this.id
+  availability_zone       = each.key
+  cidr_block              = each.value.cidr
+  map_public_ip_on_launch = true
+  tags = merge(local.tags, { Name = "${local.name}-public-${each.key}", Tier = "public" })
 }
 
-resource "aws_dynamodb_table" "tf_lock" {
-  name         = var.lock_table
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
-  attribute { name = "LockID" type = "S" }
+resource "aws_subnet" "private" {
+  for_each          = { for idx, az in local.azs : az => {
+    cidr = local.private_cidrs[idx]
+  }}
+  vpc_id            = aws_vpc.this.id
+  availability_zone = each.key
+  cidr_block        = each.value.cidr
+  tags = merge(local.tags, { Name = "${local.name}-private-${each.key}", Tier = "private" })
 }
 
-output "bucket_name" { value = aws_s3_bucket.tf_state.bucket }
-output "lock_table"  { value = aws_dynamodb_table.tf_lock.name }
-infra-core/bootstrap/variables.tf
-
-hcl
-Copy
-Edit
-variable "region" {
-  type        = string
-  description = "Region for state bucket & lock table"
-  default     = "eu-central-1"
+# Route tables
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+  tags   = merge(local.tags, { Name = "${local.name}-public-rt" })
 }
 
-variable "bucket_name" {
-  type        = string
-  description = "Globally-unique S3 bucket name for Terraform state"
+resource "aws_route" "public_internet" {
+  route_table_id         = aws_route_table.public.id
+  destination_cidr_block = "0.0.0.0/0"
+  gateway_id             = aws_internet_gateway.this.id
 }
 
-variable "lock_table" {
-  type        = string
-  description = "DynamoDB table name for Terraform state lock"
-  default     = "terraform-state-lock"
+resource "aws_route_table_association" "public_assoc" {
+  for_each       = aws_subnet.public
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.public.id
+}
+
+# NAT (optional, single NAT in first public subnet to save cost)
+resource "aws_eip" "nat" {
+  count = var.enable_nat ? 1 : 0
+  domain = "vpc"
+  tags   = merge(local.tags, { Name = "${local.name}-nat-eip" })
+}
+
+resource "aws_nat_gateway" "this" {
+  count         = var.enable_nat ? 1 : 0
+  allocation_id = aws_eip.nat[0].id
+  subnet_id     = values(aws_subnet.public)[0].id
+  tags          = merge(local.tags, { Name = "${local.name}-nat" })
+  depends_on    = [aws_internet_gateway.this]
+}
+
+resource "aws_route_table" "private" {
+  count = var.enable_nat ? 1 : 0
+  vpc_id = aws_vpc.this.id
+  tags   = merge(local.tags, { Name = "${local.name}-private-rt" })
+}
+
+resource "aws_route" "private_internet_via_nat" {
+  count                    = var.enable_nat ? 1 : 0
+  route_table_id           = aws_route_table.private[0].id
+  destination_cidr_block   = "0.0.0.0/0"
+  nat_gateway_id           = aws_nat_gateway.this[0].id
+}
+
+resource "aws_route_table_association" "private_assoc" {
+  for_each = var.enable_nat ? aws_subnet.private : {}
+  subnet_id      = each.value.id
+  route_table_id = aws_route_table.private[0].id
 }

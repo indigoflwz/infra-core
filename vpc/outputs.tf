@@ -1,7 +1,19 @@
-output "state_backend" {
-  value = {
-    region      = var.region
-    bucket_name = aws_s3_bucket.tf_state.bucket
-    lock_table  = aws_dynamodb_table.tf_lock.name
-  }
+output "vpc_id" {
+  value = aws_vpc.this.id
+}
+
+output "public_subnet_ids" {
+  value = [for s in aws_subnet.public : s.id]
+}
+
+output "private_subnet_ids" {
+  value = [for s in aws_subnet.private : s.id]
+}
+
+output "azs" {
+  value = local.azs
+}
+
+output "vpc_cidr" {
+  value = var.vpc_cidr
 }

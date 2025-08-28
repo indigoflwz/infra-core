@@ -1,0 +1,9 @@
+project      = "sre-core"
+environment  = "dev"
+region       = "eu-central-1"
+vpc_cidr     = "10.20.0.0/16"
+az_count     = 2
+enable_nat   = false   # turn true later if you want private subnets to reach the Internet
+tags = {
+  Owner = "your-name"
+}
